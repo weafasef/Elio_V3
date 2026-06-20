@@ -13,6 +13,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from trainer.heads import IntentPool
+
 
 # ═══════════════════════════════════════════════════════════
 #  Attention Pool — 从 patch token 序列抽浓缩 token
@@ -172,6 +174,9 @@ class ElioModel(nn.Module):
         # ── 动作投影 (单向量) ──
         self.proj_action = Projector(in_dim=action_dim, out_dim=llama_dim)
 
+        # ── IntentPool — 每帧 34 token → 5 意图向量 ──
+        self.intent_pool = IntentPool(dim=llama_dim)
+
         # ── 统计参数量 ──
         self._print_param_count()
 
@@ -180,15 +185,25 @@ class ElioModel(nn.Module):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         print(f"[ElioModel] total params: {total:,}  trainable: {trainable:,}")
 
-    def forward(self, batch: dict) -> torch.Tensor:
-        """将一个 batch 编码为 inputs_embeds，准备喂给 Llama。
+    def forward(self, batch: dict, llama=None) -> torch.Tensor | dict:
+        """将一个 batch 编码为 inputs_embeds；若传 llama 则继续跑 Llama + IntentPool。
 
         Args:
             batch: collate_fn 输出，各张量形状 [B, K, ...]
+            llama: (可选) 冻结的 LlamaForCausalLM。传则跑完整前向返回 intents dict
 
         Returns:
-            inputs_embeds: [B, K * tokens_per_frame, llama_dim]
-                tokens_per_frame = 1 (audio) + Q (full) + Q (fovea) + 1 (action)
+            若 llama=None: inputs_embeds [B, K*T, llama_dim]
+            若 llama 传入: {
+                "inputs_embeds": [B, K*T, llama_dim],
+                "h_t":           [B, K*T, llama_dim],
+                "intents":       [B, K, 5, llama_dim],
+                "intent_a":      [B, K, llama_dim],   # audio
+                "intent_g":      [B, K, llama_dim],   # gaze
+                "intent_f":      [B, K, llama_dim],   # frame
+                "intent_k":      [B, K, llama_dim],   # keyboard
+                "intent_m":      [B, K, llama_dim],   # mouse
+            }
         """
         B, K = batch["siglip"].shape[0], batch["siglip"].shape[1]
 
@@ -205,13 +220,34 @@ class ElioModel(nn.Module):
         action = action.unsqueeze(2)                                            # [B, K, 1, D]
 
         # ── 每帧拼接: [audio 1][full Q][fovea Q][action 1] ──
-        frame_tokens = torch.cat([audio, full_vis, fovea_vis, action], dim=2)  # [B, K, T_per_frame, D]
+        frame_tokens = torch.cat([audio, full_vis, fovea_vis, action], dim=2)  # [B, K, T, D]
         T_per_frame = frame_tokens.shape[2]  # 1 + Q + Q + 1
 
         # ── 帧顺序展开 ──
         inputs_embeds = frame_tokens.view(B, K * T_per_frame, self.llama_dim)   # [B, K*T, D]
 
-        return inputs_embeds
+        if llama is None:
+            return inputs_embeds
+
+        # ── Llama 前向 + IntentPool ──
+        inputs_embeds_bf16 = inputs_embeds.to(torch.bfloat16)
+        outputs = llama(inputs_embeds=inputs_embeds_bf16, output_hidden_states=True)
+        h_t = outputs.hidden_states[-1]                                          # [B, K*T, D]
+
+        # 切回帧
+        h_frames = h_t.float().view(B, K, T_per_frame, self.llama_dim)           # [B, K, T, D]
+        intents = self.intent_pool(h_frames)                                      # [B, K, 5, D]
+
+        return {
+            "inputs_embeds": inputs_embeds,
+            "h_t": h_t,
+            "intents": intents,
+            "intent_a": intents[:, :, 0],   # audio
+            "intent_g": intents[:, :, 1],   # gaze
+            "intent_f": intents[:, :, 2],   # frame
+            "intent_k": intents[:, :, 3],   # keyboard
+            "intent_m": intents[:, :, 4],   # mouse
+        }
 
     @property
     def tokens_per_frame(self) -> int:

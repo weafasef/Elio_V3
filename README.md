@@ -1,194 +1,153 @@
-# Elio 模型总结
+# Elio Agent v3
 
-## 一句话概括
+本地运行的具身桌面智能体。Llama 当"单刻大脑"理解此刻屏幕，可训练的 TTT 海马体当"记忆"——通过持续预测下一刻，预测错了就实时改写记忆权重，长期内化你的电脑使用习惯。
 
-本地运行的具身桌面智能体。Llama 当"单刻大脑"理解此刻屏幕，可训练的 TTT 海马体当"记忆"——通过持续预测下一刻、预测错了就实时改写记忆权重，长期内化你的电脑使用习惯。没有人工规则，记什么忘什么全靠预测误差倒逼。
-
-## 核心结构：双时间尺度
+## 项目结构
 
 ```
-跨时间 (慢, O(1))     TTT 海马体 W_fast
-                           ↕ prefix 注入 / 内层 backward 写入
-此刻理解 (快, 窗口恒定)  Llama-3.2-1B (冻结, 4bit)
+Elio_Agent_v3/
+├── elio/                         # 数据采集 + 预处理
+│   ├── preprocess.py             # 6-step 预处理流水线 → 12 .npy/session
+│   ├── record.py                 # 录屏 + 音频 + 键鼠事件
+│   ├── validate.py               # 数据校验
+│   ├── verify_env.py             # 环境自检
+│   └── download.py               # 下载模型权重
+├── trainer/                      # 训练骨架 (云端 meta-training)
+│   ├── dataset.py                # K 帧 Dataset (mmap 懒加载)
+│   ├── model.py                  # ElioModel: AttentionPool + Projector → inputs_embeds
+│   ├── heads.py                  # IntentPool + 5 预测头 + loss
+│   ├── verify_forward.py         # 端到端前向验证 (Step 1-4)
+│   └── train.py                  # (待实现) TBPTT 训练循环
+├── models/                       # 冻结权重 (~5GB)
+│   ├── Llama-3.2-1B-Instruct-abliterated/
+│   ├── siglip_base/
+│   └── dinov2_base/
+├── data/
+│   ├── raw/                      # 原始录屏 session_*/
+│   │   ├── video.mp4
+│   │   └── events.jsonl
+│   └── processed/                # 预处理输出 session_*/processed/
+│       ├── spec.json             # 元数据 (N, screen_w/h, 各文件 shape)
+│       ├── visual_siglip.npy     # [N, 196, 768] float16
+│       ├── visual_dinov2.npy     # [N, 257, 768] float16
+│       ├── visual_siglip_fovea.npy  # [N, 196, 768] float16
+│       ├── visual_dinov2_fovea.npy  # [N, 257, 768] float16
+│       ├── audio_clap.npy        # [N, 512] float16
+│       ├── actions.npy           # [N, 178] float16
+│       ├── gaze_pseudo.npy       # [N, 2] float32
+│       ├── events_flat.npy       # [M, 10] float32 (CSR)
+│       ├── events_offsets.npy    # [N+1] int64
+│       ├── frame_targets_siglip.npy  # [N, 196, 768]
+│       └── frame_targets_dinov2.npy  # [N, 257, 768]
+└── scripts/                      # 辅助脚本
 ```
 
-- **Llama 不记历史**：只读"此刻 token + 记忆 prefix"，窗口恒定 → O(1) 显存
-- **所有跨时间信息压在 W_fast**：序列再长它不涨，拒绝 KV cache 膨胀
-- **记忆不靠堆积，靠压缩**
-
-## 时间定义
-
-一刻 tick = **100ms**（10 ticks/秒）。音频按窗切片、帧取 tick 末、动作用事件编码器压成定长 token。
-
-## 感知层
-
-### 编码器（全部冻结）
-
-| 编码器 | 型号 | 输入 | 输出维度 | 确认来源 |
-|---|---|---|---|---|
-| CLAP | laion/clap-htsat-unfused | 100ms 音频窗 | **512** | `audio_config.projection_dim` |
-| SigLIP | google/siglip-base-patch16-384 | 全屏 384² / 中央凹 448² | **768** | ViT-B/16 vision hidden |
-| DINOv2 | facebook/dinov2-base | 同上，与 SigLIP 共用 | **768** | `hidden_size` |
-
-### 中央凹 (foveation)
+## 架构：单 tick 数据流
 
 ```
-frame_t (原始全屏)
-  ├─ 下采样 384² → SigLIP + DINO → z_fglob   (周边视觉)
-  └─ gaze_{t-1} 处裁 448² → SigLIP + DINO → z_ffov  (中央凹细节)
+[1] 感知 (冻结, 离线预计算)
+    z_siglip  = SigLIP(frame)              # [196, 768]
+    z_dinov2  = DINOv2(frame)              # [257, 768]
+    z_sig_fov = SigLIP(crop@gaze)          # [196, 768]  中央凹
+    z_din_fov = DINOv2(crop@gaze)          # [257, 768]  中央凹
+    z_audio   = CLAP(audio_chunk)          # [512]
+    z_action  = actions snapshot           # [178]
+
+[2] 压缩 + 投影 (慢权重, 可训练)
+    AttentionPool(concat(z_siglip, z_dinov2))  → [16, 768]  全屏 453→16
+    AttentionPool(concat(z_sig_fov, z_din_fov)) → [16, 768]  中央凹 453→16
+    Projector(16×768)                           → [16, 2048]
+    Projector(audio)                            → [1, 2048]
+    Projector(action)                           → [1, 2048]
+
+[3] 拼帧窗口
+    tokens_per_frame = 1(audio) + 16(full) + 16(fovea) + 1(action) = 34
+    inputs_embeds = [B, K×34, 2048]    (K=4 → 136 tokens)
+
+[4] Llama 推理 (冻结, bfloat16/4bit)
+    h_t = Llama(inputs_embeds=inputs_embeds)   # [B, 136, 2048]
+
+[5] IntentPool → 5 意图 (慢权重)
+    h_frames = h_t.view(B, K, 34, 2048)
+    5 learnable queries 对每帧 34 个 h 做 cross-attn
+    → intents [B, K, 5, 2048]
+
+[6] 5 个预测头 (慢权重, 各吃专属 intent)
+    audio_head:   [B,K,2048] → [B,K,512]    预测下帧 CLAP
+    gaze_head:    [B,K,2048] → [B,K,2]      预测下帧注视坐标
+    frame_head:   [B,K,2048] → [B,K,196,768] + [B,K,257,768]  预测下帧 patch 残差
+    kb_head:      [B*K,2048] → autoregressive → 键盘事件序列
+    mouse_head:   [B*K,2048] → autoregressive → 鼠标事件序列
 ```
 
-- 两路共用同一套冻结编码器权重，省显存
-- 裁切位置来自上一刻 gaze 预测，硬裁（框外像素不进编码器）
-- 全局 384² 约 16 patch token，中央凹 448² 约 16 patch token，token 数恒定
+## 关键设计
 
-### 投影维度（精确值）
+### 视觉：AttentionPool 压缩
 
-```
-进 Llama (模态投影，3 个独立线性层):
-  proj_a:    Linear(512  → 2048)    # CLAP → Llama
-  proj_fg:   Linear(1536 → 2048)    # SigLIP+DINO concat (768+768) → Llama
-  proj_ff:   与 proj_fg 共用权重      # 中央凹与周边共享投影矩阵
-  proj_act:  Linear(TBD  → 2048)    # 动作编码, 维度待定
+SigLIP (196 patch) + DINOv2 (257 patch) = **453 token** 进 Llama 太贵。16 个可学习 query 通过 cross-attention 压缩到 16 token，全屏/中央凹各一路不共享 query。`tokens_per_frame = 1 + 16 + 16 + 1 = 34`，K=4 帧 = 136 token，远在 Llama 2048 窗口内。
 
-出 Llama (预测头，4 个线性层):
-  audio_head:   Linear(2048 → 512)   # 预测下刻 CLAP latent
-  frame_head:   Linear(2048 → 1536)  # 预测下刻 latent 残差 Δz_f
-  action_head:  Linear(2048 → TBD)   # 预测下刻动作
-  gaze_head:    Linear(2048 → 2)     # 预测下刻中央凹坐标 (x, y)
-```
+### 事件：CSR + 自回归头
 
-## 单 tick 完整数据流
+键鼠事件变长序列 → CSR 格式 (`events_flat [M,10]` + `events_offsets [N+1]`)。每事件 10 维编码：
+`[type_id, key_id, button_id, x, y, dx, dy, path_len, scroll_dy, dt_ms]`
+
+两个 decoder-only transformer 头（键盘/鼠标各一），teacher forcing 展开 `[BOS, ev0, ..., ev_{n-1}] → [ev0, ..., ev_{n-1}, EOS]`。字段有效性 mask 按 type 屏蔽无关字段 loss（如 move 事件无 key_id）。
+
+### 画面预测：完整 patch 残差
+
+预测 Δz = z_{t+1} - z_t（不是绝对 z，避免平凡解）。两个独立子头（SigLIP 196×768 + DINOv2 257×768，latent 空间不同）。变化区加权：`weight = 1 + |true_Δz|`，强制模型关注动的区域。仅全屏路（焦点路内容随 gaze 跳，无因果意义）。
+
+### 总 Loss：detach 归一化
 
 ```
-[1] 感知 (冻结, no_grad)
-    z_a   = CLAP(audio_t)                          # 512
-    z_fg  = [SigLIP(frame_t↓384); DINO(frame_t↓384)]  # 1536
-    z_ff  = [SigLIP(crop_t@448); DINO(crop_t@448)]    # 1536
-    z_act = ActEnc(action_t)                        # TBD, 无动作 → no-op token
-
-[2] 投影 → 拼窗口
-    tok   = [proj_a(z_a), proj_fg(z_fg), proj_ff(z_ff), proj_act(z_act)]
-    mem   = read(W_fast)                            # prefix token(s)
-    window = [mem] + tok                             # 长度恒定
-
-[3] Llama 推理 (冻结)
-    h_t = Llama(window)                              # 2048
-
-[4] 记忆写入 (TTT 内层, 可训练)
-    ŝ     = f(W_fast; h_t)
-    L_in  = ||ŝ - target_latent_t||²
-    W_fast ← W_fast - η · ∇L_in                      # 单步梯度, 激活即弃
-
-[5] 预测下一刻
-    ẑ_a_{t+1}  = audio_head(h_t)                     # 下刻音频
-    Δẑ_f_{t+1} = frame_head(h_t)                     # 下刻画面残差
-    â_{t+1}    = action_head(h_t)                    # 下刻动作 (部署时执行)
-    gaze_{t+1} = gaze_head(h_t)                      # 下刻中央凹坐标
+L = L_audio/L_audio.detach() + L_frame/L_frame.detach()
+  + L_gaze/L_gaze.detach()   + L_kb/L_kb.detach()
+  + L_mouse/L_mouse.detach()
 ```
 
-## 关键设计决策
+每项值恒≈1，5 头梯度自动同量级。日志单独打印原始 loss 看真实收敛。
 
-### 动作：双重角色 + 双并行自回归
+### inputs_embeds 机制
 
-动作既是 Elio 要执行的**输出**，也是世界模型要预测的**对象**（建模"你怎么操作电脑"）。
-
-**输入侧**（变长事件流 → 定长 token）：
-```
-单事件编码:
-  键盘:    [KB,    down/up, 键码]
-  鼠标:    [MS,    down/up, 左/右/中]
-  鼠标移动: [MS,    move,   起点, 终点, 轨迹长度]
-
-→ 各字段过独立 embedding → 拼成事件向量
-→ 小序列编码器(几层 Transformer) pool 成定长
-→ 键盘流、鼠标流各 1 个 token = 共 2 个动作 token
-```
-
-**输出侧**（双并行自回归）：
-- 键盘流、鼠标流各自回归吐事件直到 eos
-- 拆 down/up → 长按、拖拽、组合键自然涌现
-- 自回归只在刻内展开，守住 100ms 节奏
-
-**输入输出共享事件词表**：两侧复用同一套类型/键码 embedding，模型不用学两遍"什么是按下 A"。
-
-### 画面预测：残差目标
-
-GUI 大部分区域静止，直接预测整帧会学到"复制上一帧"。改成：
-```
-target = z_f_{t+1} - z_f_t               # 预测变化量
-w(p)   = 1 + α·|Δz_f(p)|                # 变化大的 patch 权重高
-L_frame = Σ_p w(p)·||Δẑ_f(p) - Δz_f(p)||²
-```
-逼模型学"我这个动作改变了什么"——因果倒逼。
-
-### Gaze：硬裁 + 伪标签解耦
-
-crop 用硬裁真省 token，坐标回归用伪标签直接监督保持可微：
-```
-伪标签 = argmax_region |frame_t - frame_{t-1}|   # motion saliency 峰值
-L_gaze = ||gaze_pred - 伪标签||²
-λ_gaze: 0.5 起 → 后期降到 0.1                      # 先拄拐杖, 后自主
-```
-
-## 训练：两阶段
-
-### 阶段一：云端 meta-training (24GB)
-
-双层优化，TBPTT 截断。学的不是"知识"，是**如何用微型梯度下降快速记住东西**。
-
-```
-for batch in dataloader:
-    W_fast = init_from(θ_meta)
-    for window in chunk(batch, K):      # K=4 起步
-        for t in window:
-            h = forward(W_fast, perceive(t))
-            W_fast = inner_update(W_fast, h)  # 保留计算图
-            L_out += weighted_loss(predict(h), target_{t+1})
-        L_out.backward()                # BPTT 展开 K 步 → θ_meta
-        opt_meta.step()
-        W_fast = W_fast.detach()        # 跨窗口梯度截断
-```
-
-θ_meta = {内层学习率 η, W_fast 初始化, 投影矩阵, 预测头, 双自回归头, 事件编码器, 共享 embedding}
-
-### 阶段二：本地部署 (8GB)
-
-冻结 θ_meta，只留内层闭环：
-
-```
-W_fast = load(trained_init)
-while running:                          # 无窗口、无截断、无穷长
-    h = forward(W_fast, perceive(now))
-    L_in = self_sup_loss(h)
-    W_fast = inner_update(W_fast, h)    # 单步 backward, 激活即弃
-    execute(action_head(h))
-```
-
-训练时截断，部署时连续。
+投影层的 2048-dim 输出通过 `llama(inputs_embeds=...)` 直接替代 Llama 的词嵌入表，绕过 tokenizer。梯度穿过 Llama 流回慢权重，但 Llama 参数 `requires_grad=False` 不更新。
 
 ## 组件归属
 
-| | 组件 |
-|---|---|
-| **冻结** | CLAP、SigLIP、DINOv2、Llama-3.2-1B (4bit) |
-| **慢权重** (云端学, 本地固定) | TTT 初始化、内层学习率、投影层、预测头、双自回归头、事件编码器、共享 embedding |
-| **快权重** (本地实时进化) | W_fast 海马体 —— 唯一在用户电脑上持续改变的东西 |
+| 冻结 | 慢权重 (云端学) |
+|------|----------------|
+| Llama-3.2-1B (bf16/4bit) | ElioModel: AttentionPool ×2 + Projector ×4 |
+| SigLIP, DINOv2 | IntentPool (5 query + cross-attn) |
+| CLAP (音频编码) | audio_head, gaze_head, frame_head |
+| | AutoregHead ×2 (键盘/鼠标, 含 EventEmbedder) |
 
-## 实施路线（按风险倒序）
+慢权重总计 **~33.6M** 参数。快权重 (W_fast) 待 Step 5 插入。
 
-| 阶段 | 内容 | 验证目标 | 依赖真数据 |
-|---|---|---|---|
-| **P0 命脉** | TTT 内层更新 + TBPTT 外层回传, Llama 用 MLP stub, 模态用随机张量 | θ_meta 梯度非零、K=4 不爆、截断正确 | 否 |
-| P1 感知接入 | 接真 CLAP/SigLIP/DINO, gaze 伪标签硬裁 | 单帧编码显存、token 数 | 否 |
-| P2 接真 Llama | 1B 4bit + 记忆 prefix 注入 | 端到端显存 ≤8GB | 否 |
-| P3 数据与训练 | 录屏+音频+动作, 跑阶段一 | loss 下降、动作预测准确率 | 是 |
-| P4 部署闭环 | 阶段二本地连续运行 | 长期显存平稳、记忆生效 | 是 |
+## 已验证 (Step 1-4)
 
-## 待实测参数
+```
+python -m trainer.verify_forward --batch-size 1 --K 4
+```
 
-- **W_fast 容量**：2 块 2048×2048 够不够装个人习惯，P0 实测定
-- **K 上限**：24GB 能展开多深，P0 给出
-- **动作编码维度**：128~256 起步，P3 看效果
-- **记忆 prefix 长度**：从 W_fast 读出几个 token 注入 Llama
-- **λ 权重**：初值给好，P3 看各模态 loss 曲线调
+| 检查项 | 状态 |
+|--------|------|
+| Dataset K-frame 窗口 + mmap 懒加载 | ✅ |
+| ElioModel → inputs_embeds [B,136,2048] | ✅ |
+| Llama → h_t [B,136,2048] | ✅ |
+| IntentPool → intents [B,K,5,2048] | ✅ |
+| audio/gaze/frame 头 shape + loss | ✅ |
+| kb/mouse AR 头 teacher forcing + field_mask + 空帧 | ✅ |
+| 5 头 detach 归一化 backward | ✅ |
+| ElioModel 45 params grad ≠ 0 | ✅ |
+| Llama 146 params grad = None | ✅ |
+| 显存峰值 9.95GB (bf16) | ✅ |
+
+## 实施路线
+
+| 步骤 | 内容 | 状态 |
+|------|------|------|
+| preprocess | 6-step 流水线 → 12 .npy/session | ✅ 完成 |
+| Step 1-3 | Dataset + ElioModel + Llama forward | ✅ 完成 |
+| Step 4 | IntentPool + 5 预测头 + total_loss | ✅ 完成 |
+| Step 5 | TTT 内层循环 + TBPTT 外层回传 | 待实现 |
+| Step 6 | 训练循环 + checkpoint | 待实现 |
+| Step 7 | 本地部署闭环 | 待实现 |
