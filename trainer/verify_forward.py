@@ -144,7 +144,7 @@ def verify_forward(
     # 预测头
     audio_head = SimpleHead(in_dim=2048, out_dim=512, hidden=1024).to(device)
     gaze_head = SimpleHead(in_dim=2048, out_dim=2, hidden=1024).to(device)
-    frame_head = FrameHead(in_dim=2048, hidden=2048).to(device)
+    frame_head = FrameHead().to(device)
     kb_head = AutoregHead(stream_type="keyboard").to(device)
     mouse_head = AutoregHead(stream_type="mouse").to(device)
 

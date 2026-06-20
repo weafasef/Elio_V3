@@ -97,8 +97,24 @@ class ProcessedDataset(Dataset):
     def __len__(self) -> int:
         return self._total_windows
 
-    def __getitem__(self, idx: int) -> dict:
-        si, t0 = self.window_starts[idx]
+    @property
+    def session_lengths(self) -> list[int]:
+        """各 session 帧数。"""
+        return [s["N"] for s in self.sessions]
+
+    def get_segment(self, si: int, t0: int) -> dict:
+        """训练循环用：按坐标顺序取段。K 帧不足时用剩余帧（末尾）。
+
+        Args:
+            si: session 索引
+            t0: 起始帧索引，越界自动 clamp 到 N-2（至少留 1 帧做 target）
+        """
+        sess = self.sessions[si]
+        t0 = min(t0, sess["N"] - 2)          # 至少留 1 帧做 target
+        return self._load(si, t0)
+
+    def _load(self, si: int, t0: int) -> dict:
+        """按 (session_idx, frame_start) 加载 K 帧段。__getitem__ 和 get_segment 共用。"""
         sess = self.sessions[si]
         K = self.K
         t1 = t0 + K  # 不含
@@ -134,8 +150,6 @@ class ProcessedDataset(Dataset):
             events = [torch.zeros((0, EVENT_DIM), dtype=torch.float32) for _ in range(K)]
 
         # ── 帧级 target: Δz (残差) ──
-        # targets 存在同目录下，但不在 sess mmap dict 里。每次读取首帧是 mmap 的，copy 代价可接受。
-        # 为保持接口简洁，targets 也在此返回。
         pdir = Path(sess["siglip"].filename).parent
         tgt_s_path = pdir / "frame_targets_siglip.npy"
         tgt_d_path = pdir / "frame_targets_dinov2.npy"
@@ -160,6 +174,10 @@ class ProcessedDataset(Dataset):
             "tgt_siglip": tgt_s,           # [K, 196, 768]
             "tgt_dinov2": tgt_d,           # [K, 257, 768]
         }
+
+    def __getitem__(self, idx: int) -> dict:
+        si, t0 = self.window_starts[idx]
+        return self._load(si, t0)
 
     def close(self):
         """关闭所有 mmap（DataLoader worker 退出时调用）。"""

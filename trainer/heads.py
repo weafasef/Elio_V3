@@ -99,35 +99,69 @@ class SimpleHead(nn.Module):
 
 
 # ═══════════════════════════════════════════════════════════
+#  PatchMLP — 共享的 per-patch 渲染器
+# ═══════════════════════════════════════════════════════════
+
+class PatchMLP(nn.Module):
+    """单个 patch seed → 完整 embedding 的共享 MLP。
+
+    所有 patch 共享同一套权重："把描述变成画面"对每个 patch 同构。
+    """
+
+    def __init__(self, in_dim: int = 128, hidden: int = 512, out_dim: int = 768):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, out_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """x: [..., in_dim] → [..., out_dim]"""
+        return self.net(x)
+
+
+# ═══════════════════════════════════════════════════════════
 #  FrameHead — 全屏 patch 残差 (SigLIP 196×768 + DINOv2 257×768)
 # ═══════════════════════════════════════════════════════════
 
 class FrameHead(nn.Module):
     """预测完整 patch 残差 Δz = z_{t+1} - z_t。
 
+    低秩分解: intent [2048] → per-patch seed [P, 256] → 共享 MLP(256→1024→768) → [P, 768]。
+    每个子头约 104M 参数 (vs 原 308M/404M 全连接)。
+
     两个独立子头，分别预测 SigLIP 196×768 和 DINOv2 257×768。
     """
 
-    def __init__(self, in_dim: int = 2048, hidden: int = 2048):
+    def __init__(self, in_dim: int = 2048, seed_dim: int = 256,
+                 mlp_hidden: int = 1024, out_dim: int = 768):
         super().__init__()
-        # SigLIP 子头
-        self.siglip_net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, 196 * 768),
-        )
-        # DINOv2 子头
-        self.dino_net = nn.Sequential(
-            nn.Linear(in_dim, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, 257 * 768),
-        )
+        self.seed_dim = seed_dim
+        self.out_dim = out_dim
+
+        # SigLIP 子头: intent → 196 个 seed → 共享 MLP → [196, 768]
+        self.siglip_seed_proj = nn.Linear(in_dim, 196 * seed_dim)
+        self.siglip_mlp = PatchMLP(seed_dim, mlp_hidden, out_dim)
+
+        # DINOv2 子头: intent → 257 个 seed → 共享 MLP → [257, 768]
+        self.dino_seed_proj = nn.Linear(in_dim, 257 * seed_dim)
+        self.dino_mlp = PatchMLP(seed_dim, mlp_hidden, out_dim)
 
     def forward(self, intent_f: torch.Tensor):
         """intent_f: [B, K, 2048] → siglip_dz [B,K,196,768], dino_dz [B,K,257,768]"""
         B, K = intent_f.shape[0], intent_f.shape[1]
-        siglip_dz = self.siglip_net(intent_f).view(B, K, 196, 768)
-        dino_dz = self.dino_net(intent_f).view(B, K, 257, 768)
+
+        # SigLIP: intent → seeds → reshape → MLP
+        siglip_seeds = self.siglip_seed_proj(intent_f)                 # [B, K, 196*128]
+        siglip_seeds = siglip_seeds.view(B, K, 196, self.seed_dim)    # [B, K, 196, 128]
+        siglip_dz = self.siglip_mlp(siglip_seeds)                     # [B, K, 196, 768]
+
+        # DINOv2: 同上
+        dino_seeds = self.dino_seed_proj(intent_f)                     # [B, K, 257*128]
+        dino_seeds = dino_seeds.view(B, K, 257, self.seed_dim)        # [B, K, 257, 128]
+        dino_dz = self.dino_mlp(dino_seeds)                           # [B, K, 257, 768]
+
         return siglip_dz, dino_dz
 
 

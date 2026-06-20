@@ -278,7 +278,7 @@ def verify_ttt(
     heads = nn.ModuleDict({
         "audio": SimpleHead(in_dim=2048, out_dim=512, hidden=1024).to(device),
         "gaze":  SimpleHead(in_dim=2048, out_dim=2, hidden=1024).to(device),
-        "frame": FrameHead(in_dim=2048, hidden=2048).to(device),
+        "frame": FrameHead().to(device),
         "kb":    AutoregHead(stream_type="keyboard").to(device),
         "mouse": AutoregHead(stream_type="mouse").to(device),
     })
