@@ -18,11 +18,15 @@
     dataset/<timestamp>/processed/
     ├── visual_siglip.npy          [N, Ps, 768]  float16
     ├── visual_dinov2.npy          [N, Pd, 768]  float16
+    ├── visual_siglip_fovea.npy    [N, Pf, 768]  float16  ← 焦点路
+    ├── visual_dinov2_fovea.npy    [N, Pd, 768]  float16  ← 焦点路
     ├── frame_targets_siglip.npy   [N, Ps, 768]  float16  ← Δz_f 残差
     ├── frame_targets_dinov2.npy   [N, Pd, 768]  float16  ← Δz_f 残差
     ├── audio_clap.npy             [N, 512]      float16  ← CLAP 嵌入
     ├── gaze_pseudo.npy            [N, 2]        float32  ← motion saliency
     ├── actions.npy                [N, 178]      float32
+    ├── events_flat.npy            [M, 10]       float32  ← 变长事件序列
+    ├── events_offsets.npy         [N+1]         int64    ← CSR 行指针
     ├── timestamps.npy             [N]           float64
     └── spec.json
 """
@@ -71,6 +75,9 @@ KEY_ORDER = [
 K = len(KEY_ORDER)
 A_DIM = 10 + K * 2                # 178
 KEY_TO_IDX = {k: i for i, k in enumerate(KEY_ORDER)}
+
+E_DIM = 10                         # 单事件编码维度
+BUTTON_TO_ID = {"left": 0, "right": 1, "middle": 2}
 
 
 # ═══════════════════════════════════════════════════════════
@@ -229,6 +236,199 @@ def compute_actions(
             act[base + 1] = 1.0 if keys_held[k] else 0.0
 
     return actions
+
+
+# ═══════════════════════════════════════════════════════════
+#  变长事件序列 (CSR)
+# ═══════════════════════════════════════════════════════════
+
+def _flush_move(
+    event_rows: list[list],
+    start_x: float, start_y: float,
+    end_x: float, end_y: float,
+    path_len: float, last_dt_ms: float,
+    screen_w: int, screen_h: int,
+):
+    """写一个 type=4 (move) 行，合并段的终点作为坐标。"""
+    event_rows.append([
+        4,                                    # type_id = move
+        -1,                                   # key_id: n/a
+        -1,                                   # button_id: n/a
+        end_x / screen_w,                     # x_norm: 段终点
+        end_y / screen_h,                     # y_norm: 段终点
+        (end_x - start_x) / screen_w,         # dx_norm: 净位移
+        (end_y - start_y) / screen_h,         # dy_norm: 净位移
+        path_len / screen_w,                  # path_len_norm
+        0.0,                                  # scroll_dy: n/a
+        last_dt_ms,                           # dt_ms: 段最后事件的帧内偏移
+    ])
+
+
+def compute_events_csr(
+    events: list[dict],
+    t0_ns: int,
+    total_frames: int,
+    screen_w: int,
+    screen_h: int,
+    max_frames: int | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    """从事件序列计算变长事件 CSR。
+
+    Returns:
+        events_flat   [M, E_DIM] float32  所有帧事件拍平
+        events_offsets [N+1]    int64      帧 t 事件 = flat[off[t]:off[t+1]]
+
+    核心原则:
+      - down/up 各自独立按 ts_ns 落桶，绝不配对
+      - mouse_move 合并成段，遇非 move 事件时 flush
+      - 游标 cur_x/cur_y 跨帧保持
+      - 帧分桶逻辑与 compute_actions() 完全一致
+    """
+    N = total_frames if max_frames is None else min(total_frames, max_frames)
+
+    event_rows: list[list] = []
+    offsets = np.zeros(N + 1, dtype=np.int64)
+
+    cur_x = 0.0
+    cur_y = 0.0
+
+    # move 合并缓冲
+    move_buf_start = None    # (start_x, start_y)
+    move_buf_end = (0.0, 0.0)
+    move_buf_path = 0.0
+    move_buf_last_dt = 0.0
+    move_buf_prev = (0.0, 0.0)
+
+    event_idx = 0
+    E = len(events)
+
+    for frame_idx in range(N):
+        frame_start = t0_ns + frame_idx * FRAME_INTERVAL_NS
+        frame_end = t0_ns + (frame_idx + 1) * FRAME_INTERVAL_NS
+
+        # 起始偏移
+        offsets[frame_idx] = len(event_rows)
+
+        while event_idx < E and events[event_idx]["ts_ns"] < frame_end:
+            ev = events[event_idx]
+            if ev["ts_ns"] < frame_start:
+                event_idx += 1
+                continue
+
+            dt_ms = (ev["ts_ns"] - frame_start) / 1e6
+            t = ev["type"]
+
+            if t == "mouse_move":
+                x = float(ev["x"])
+                y = float(ev["y"])
+
+                if move_buf_start is None:
+                    move_buf_start = (cur_x, cur_y)
+                    move_buf_prev = (cur_x, cur_y)
+                    move_buf_path = 0.0
+
+                move_buf_path += np.sqrt(
+                    (x - move_buf_prev[0])**2 + (y - move_buf_prev[1])**2
+                )
+                move_buf_prev = (x, y)
+                move_buf_end = (x, y)
+                move_buf_last_dt = dt_ms
+                cur_x, cur_y = x, y
+
+            else:
+                # 非 move 事件 → 先 flush move 段
+                if move_buf_start is not None:
+                    _flush_move(
+                        event_rows,
+                        move_buf_start[0], move_buf_start[1],
+                        move_buf_end[0], move_buf_end[1],
+                        move_buf_path, move_buf_last_dt,
+                        screen_w, screen_h,
+                    )
+                    move_buf_start = None
+
+                if t == "mouse_click":
+                    btn = ev.get("button", "")
+                    pressed = ev.get("pressed", False)
+                    btn_id = BUTTON_TO_ID.get(btn, -1)
+                    type_id = 2 if pressed else 3   # 2=mouse_down, 3=mouse_up
+                    event_rows.append([
+                        type_id,
+                        -1,                        # key_id: n/a
+                        btn_id,
+                        cur_x / screen_w,          # 游标位置
+                        cur_y / screen_h,
+                        0.0, 0.0, 0.0,            # dx/dy/path: n/a
+                        0.0,                       # scroll_dy: n/a
+                        dt_ms,
+                    ])
+
+                elif t == "mouse_scroll":
+                    scroll_dy = float(ev.get("dy", 0))
+                    event_rows.append([
+                        5,                          # type_id = scroll
+                        -1,                        # key_id: n/a
+                        -1,                        # button_id: n/a
+                        cur_x / screen_w,
+                        cur_y / screen_h,
+                        0.0, 0.0, 0.0,            # dx/dy/path: n/a
+                        scroll_dy,                 # scroll_dy
+                        dt_ms,
+                    ])
+
+                elif t == "key_press":
+                    k = _normalize_key(ev.get("key", ""))
+                    key_id = KEY_TO_IDX.get(k, -1)
+                    if key_id >= 0:
+                        event_rows.append([
+                            0,                        # type_id = key_down
+                            key_id,
+                            -1,                      # button_id: n/a
+                            cur_x / screen_w,        # 按键时游标位置
+                            cur_y / screen_h,
+                            0.0, 0.0, 0.0,          # dx/dy/path: n/a
+                            0.0,                     # scroll_dy: n/a
+                            dt_ms,
+                        ])
+
+                elif t == "key_release":
+                    k = _normalize_key(ev.get("key", ""))
+                    key_id = KEY_TO_IDX.get(k, -1)
+                    if key_id >= 0:
+                        event_rows.append([
+                            1,                        # type_id = key_up
+                            key_id,
+                            -1,                      # button_id: n/a
+                            cur_x / screen_w,
+                            cur_y / screen_h,
+                            0.0, 0.0, 0.0,          # dx/dy/path: n/a
+                            0.0,                     # scroll_dy: n/a
+                            dt_ms,
+                        ])
+
+            event_idx += 1
+
+        # 帧事件遍历完 → flush 残留 move 段
+        if move_buf_start is not None:
+            _flush_move(
+                event_rows,
+                move_buf_start[0], move_buf_start[1],
+                move_buf_end[0], move_buf_end[1],
+                move_buf_path, move_buf_last_dt,
+                screen_w, screen_h,
+            )
+            move_buf_start = None
+
+    # 末尾偏移
+    offsets[N] = len(event_rows)
+
+    # → np arrays
+    M = len(event_rows)
+    flat = np.zeros((M, E_DIM), dtype=np.float32)
+    for i, row in enumerate(event_rows):
+        flat[i] = row
+
+    return flat, offsets
 
 
 # ═══════════════════════════════════════════════════════════
@@ -534,6 +734,137 @@ def encode_visual(
 
 
 # ═══════════════════════════════════════════════════════════
+#  焦点路视觉编码 (fovea)
+# ═══════════════════════════════════════════════════════════
+
+def _crop_fovea(
+    frame_rgb: np.ndarray,
+    gx: float,                 # 归一化 x [0,1]
+    gy: float,                 # 归一化 y [0,1]
+    W: int,
+    H: int,
+    crop_size: int,
+) -> np.ndarray:
+    """以 gaze (gx, gy) 为中心裁 crop_size×crop_size，clamp 边界。
+
+    注意: frame_rgb 是 [H, W, 3] numpy 数组，切片用 [y, x] 顺序。
+    """
+    half = crop_size // 2
+    cx = int(gx * W)
+    cy = int(gy * H)
+
+    # clamp：中心推回屏内，保证裁框完整无黑边
+    cx = min(max(cx, half), W - half)
+    cy = min(max(cy, half), H - half)
+
+    crop = frame_rgb[cy - half:cy + half, cx - half:cx + half]
+    return crop
+
+
+def encode_fovea(
+    video_path: Path,
+    N: int,
+    gaze: np.ndarray,           # [N, 2] float32 归一化坐标
+    screen_w: int,
+    screen_h: int,
+    siglip_model,
+    dinov2_model,
+    siglip_processor,
+    dinov2_processor,
+    device: str,
+    batch_size: int,
+    output_dir: Path,
+    crop_size: int = 448,
+    max_frames: int | None = None,
+) -> tuple[int, int, int, int]:
+    """一次视频遍历同时编码 SigLIP + DINOv2 焦点路 → 写入 memmap。
+
+    Returns: (P_siglip, P_dino, D_siglip, D_dino) 维度信息。
+    """
+    N_enc = N if max_frames is None else min(N, max_frames)
+
+    cap = cv2.VideoCapture(str(video_path))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+    # ── 首帧确认 patch 数 ──
+    ret, first_frame = cap.read()
+    if not ret:
+        raise RuntimeError("无法读取视频第一帧")
+    first_rgb = cv2.cvtColor(first_frame, cv2.COLOR_BGR2RGB)
+    gx0, gy0 = float(gaze[0, 0]), float(gaze[0, 1])
+    first_crop = _crop_fovea(first_rgb, gx0, gy0, screen_w, screen_h, crop_size)
+    test_img = Image.fromarray(first_crop)
+
+    with torch.no_grad():
+        si = siglip_processor(images=test_img, return_tensors="pt").to(device)
+        so = siglip_model(**si)
+        P_siglip = so.last_hidden_state.shape[1]
+        D_siglip = siglip_model.config.hidden_size
+
+        di = dinov2_processor(images=test_img, return_tensors="pt").to(device)
+        do = dinov2_model(**di)
+        P_dino = do.last_hidden_state.shape[1]
+        D_dino = dinov2_model.config.hidden_size
+
+    print(f"  Fovea SigLIP: [{N_enc}, {P_siglip}, {D_siglip}] float16  (crop={crop_size})")
+    print(f"  Fovea DINOv2: [{N_enc}, {P_dino}, {D_dino}] float16  (crop={crop_size})")
+
+    # ── memmap 预分配 ──
+    siglip_mmap = np.lib.format.open_memmap(
+        str(output_dir / "visual_siglip_fovea.npy"), mode="w+",
+        dtype=np.float16, shape=(N_enc, P_siglip, D_siglip),
+    )
+    dinov2_mmap = np.lib.format.open_memmap(
+        str(output_dir / "visual_dinov2_fovea.npy"), mode="w+",
+        dtype=np.float16, shape=(N_enc, P_dino, D_dino),
+    )
+
+    # ── 回退开头，批量编码 ──
+    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+    pbar = tqdm(total=N_enc, desc="Fovea visual", unit="frame", ncols=100)
+
+    for batch_start in range(0, N_enc, batch_size):
+        batch_end = min(batch_start + batch_size, N_enc)
+        batch_count = batch_end - batch_start
+
+        crops: list[Image.Image] = []
+        for t in range(batch_start, batch_end):
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            gx = float(gaze[t, 0])
+            gy = float(gaze[t, 1])
+            crop = _crop_fovea(frame_rgb, gx, gy, screen_w, screen_h, crop_size)
+            crops.append(Image.fromarray(crop))
+
+        actual = len(crops)
+        if actual == 0:
+            break
+
+        si = siglip_processor(images=crops, return_tensors="pt").to(device)
+        di = dinov2_processor(images=crops, return_tensors="pt").to(device)
+
+        with torch.no_grad():
+            s_out = siglip_model(**si)
+            d_out = dinov2_model(**di)
+            s_vecs = s_out.last_hidden_state.cpu().numpy().astype(np.float16)
+            d_vecs = d_out.last_hidden_state.cpu().numpy().astype(np.float16)
+
+        siglip_mmap[batch_start:batch_start + actual] = s_vecs
+        dinov2_mmap[batch_start:batch_start + actual] = d_vecs
+        pbar.update(actual)
+
+    pbar.close()
+    cap.release()
+
+    siglip_mmap.flush()
+    dinov2_mmap.flush()
+
+    return P_siglip, P_dino, D_siglip, D_dino
+
+
+# ═══════════════════════════════════════════════════════════
 #  Legacy mel spectrogram (兼容旧 trainer)
 # ═══════════════════════════════════════════════════════════
 
@@ -641,7 +972,7 @@ def preprocess_session(
     # ═══════════════════════════════════════════════════════
     #  Step 1: Gaze 伪标签 (Pass 1 — 只读像素, 不跑模型)
     # ═══════════════════════════════════════════════════════
-    print("\n── Step 1/5: Gaze pseudo-labels ──")
+    print("\n── Step 1/6: Gaze pseudo-labels ──")
     if _skip("gaze_pseudo.npy"):
         gaze = np.load(str(output_dir / "gaze_pseudo.npy"))
     else:
@@ -658,7 +989,7 @@ def preprocess_session(
     has_audio = audio_path.exists()
 
     if has_audio:
-        print("\n── Step 2/5: CLAP audio encoding ──")
+        print("\n── Step 2/6: CLAP audio encoding ──")
         if _skip("audio_clap.npy"):
             audio_clap = np.load(str(output_dir / "audio_clap.npy"))
         else:
@@ -686,34 +1017,81 @@ def preprocess_session(
             torch.cuda.empty_cache()
         print("  CLAP unloaded")
     else:
-        print("\n── Step 2/5: No audio_raw.npy — skipping ──")
+        print("\n── Step 2/6: No audio_raw.npy — skipping ──")
 
     # ═══════════════════════════════════════════════════════
-    #  Step 3: 视觉编码 (Pass 2 — SigLIP + DINOv2)
+    #  Step 3: 视觉编码 (Pass 2 — SigLIP + DINOv2, full + fovea)
     # ═══════════════════════════════════════════════════════
-    print("\n── Step 3/5: Visual encoding ──")
+    print("\n── Step 3/6: Visual encoding ──")
     vis_siglip_path = output_dir / "visual_siglip.npy"
     vis_dinov2_path = output_dir / "visual_dinov2.npy"
-    both_vis_exist = _skip("visual_siglip.npy") and _skip("visual_dinov2.npy")
+    fov_siglip_path = output_dir / "visual_siglip_fovea.npy"
+    fov_dinov2_path = output_dir / "visual_dinov2_fovea.npy"
 
-    if both_vis_exist:
+    need_full = not (_skip("visual_siglip.npy") and _skip("visual_dinov2.npy"))
+    need_fovea = not (_skip("visual_siglip_fovea.npy") and _skip("visual_dinov2_fovea.npy"))
+
+    P_sf = P_df = D_sf = D_df = 0
+
+    if need_full or need_fovea:
+        siglip, dinov2, siglip_proc, dinov2_proc = load_vision_models(device)
+
+        if need_full:
+            P_s, P_d, D_s, D_d = encode_visual(
+                video_path, N, siglip, dinov2, siglip_proc, dinov2_proc,
+                device, batch_size, output_dir, max_frames,
+            )
+        else:
+            # 读已有全屏特征形状 (用于 spec)
+            siglip_feat = np.load(str(vis_siglip_path), mmap_mode="r")
+            dinov2_feat = np.load(str(vis_dinov2_path), mmap_mode="r")
+            P_s, D_s = siglip_feat.shape[1], siglip_feat.shape[2]
+            P_d, D_d = dinov2_feat.shape[1], dinov2_feat.shape[2]
+            siglip_feat._mmap.close()
+            dinov2_feat._mmap.close()
+
+        if need_fovea:
+            P_sf, P_df, D_sf, D_df = encode_fovea(
+                video_path, N, gaze, screen_w, screen_h,
+                siglip, dinov2, siglip_proc, dinov2_proc,
+                device, batch_size, output_dir, max_frames=max_frames,
+            )
+        else:
+            # 读已有焦点特征形状 (用于 spec)
+            if fov_siglip_path.exists():
+                fov_s = np.load(str(fov_siglip_path), mmap_mode="r")
+                P_sf, D_sf = fov_s.shape[1], fov_s.shape[2]
+                fov_s._mmap.close()
+            if fov_dinov2_path.exists():
+                fov_d = np.load(str(fov_dinov2_path), mmap_mode="r")
+                P_df, D_df = fov_d.shape[1], fov_d.shape[2]
+                fov_d._mmap.close()
+
+        # 卸载视觉模型
+        del siglip, dinov2, siglip_proc, dinov2_proc
+        if device.startswith("cuda"):
+            torch.cuda.empty_cache()
+        print("  Vision models unloaded")
+    else:
+        # resume: 所有 4 个文件都存在，只读形状
         siglip_feat = np.load(str(vis_siglip_path), mmap_mode="r")
         dinov2_feat = np.load(str(vis_dinov2_path), mmap_mode="r")
         P_s, D_s = siglip_feat.shape[1], siglip_feat.shape[2]
         P_d, D_d = dinov2_feat.shape[1], dinov2_feat.shape[2]
         siglip_feat._mmap.close()
         dinov2_feat._mmap.close()
-    else:
-        siglip, dinov2, siglip_proc, dinov2_proc = load_vision_models(device)
-        P_s, P_d, D_s, D_d = encode_visual(
-            video_path, N, siglip, dinov2, siglip_proc, dinov2_proc,
-            device, batch_size, output_dir, max_frames,
-        )
+
+        fov_s = np.load(str(fov_siglip_path), mmap_mode="r")
+        fov_d = np.load(str(fov_dinov2_path), mmap_mode="r")
+        P_sf, D_sf = fov_s.shape[1], fov_s.shape[2]
+        P_df, D_df = fov_d.shape[1], fov_d.shape[2]
+        fov_s._mmap.close()
+        fov_d._mmap.close()
 
     # ═══════════════════════════════════════════════════════
     #  Step 4: 残差目标
     # ═══════════════════════════════════════════════════════
-    print("\n── Step 4/5: Residual targets ──")
+    print("\n── Step 4/6: Residual targets ──")
     if _skip("frame_targets_siglip.npy"):
         shape_s = np.load(str(output_dir / "frame_targets_siglip.npy"), mmap_mode="r").shape
     else:
@@ -745,7 +1123,7 @@ def preprocess_session(
     # ═══════════════════════════════════════════════════════
     #  Step 5: 动作向量 + 时间戳
     # ═══════════════════════════════════════════════════════
-    print("\n── Step 5/5: Actions & timestamps ──")
+    print("\n── Step 5/6: Actions & timestamps ──")
     actions = compute_actions(events, t0_ns, N, screen_w, screen_h)
     np.save(str(output_dir / "actions.npy"), actions)
     print(f"  actions:    {actions.shape}  float32  "
@@ -759,13 +1137,58 @@ def preprocess_session(
     print(f"  timestamps: {timestamps.shape}  float64")
 
     # ═══════════════════════════════════════════════════════
+    #  Step 6: 变长事件序列 (CSR)
+    # ═══════════════════════════════════════════════════════
+    print("\n── Step 6/6: Events CSR ──")
+    flat_path = output_dir / "events_flat.npy"
+    off_path = output_dir / "events_offsets.npy"
+
+    if _skip("events_flat.npy") and _skip("events_offsets.npy"):
+        flat_mmap = np.load(str(flat_path), mmap_mode="r")
+        M = flat_mmap.shape[0]
+        flat = flat_mmap
+        offsets = np.load(str(off_path))
+        flat_is_mmap = True
+    else:
+        flat, offsets = compute_events_csr(
+            events, t0_ns, N, screen_w, screen_h, max_frames,
+        )
+        M = flat.shape[0]
+
+        # 校验自洽
+        assert offsets[-1] == M, \
+            f"CSR self-consistency: offsets[-1]={offsets[-1]} != M={M}"
+        assert np.all(np.diff(offsets) >= 0), \
+            "CSR offsets not monotonic"
+
+        np.save(str(flat_path), flat)
+        np.save(str(off_path), offsets)
+        flat_is_mmap = False
+
+    # 打印统计
+    counts = np.diff(offsets)
+    type_ids = flat[:M][:, 0].astype(np.int32) if M > 0 else np.array([], dtype=np.int32)
+    type_names = {0: "key_down", 1: "key_up", 2: "mouse_down",
+                  3: "mouse_up", 4: "move", 5: "scroll"}
+    print(f"  events_flat:    [{M}, {E_DIM}]  float32")
+    print(f"  events_offsets: [{N + 1}]  int64")
+    print(f"  per-frame: mean={counts.mean():.1f}  max={counts.max()}  "
+          f"p50={int(np.median(counts))}  p99={int(np.percentile(counts, 99))}")
+    for tid in sorted(type_names):
+        n = int((type_ids == tid).sum())
+        if n > 0:
+            print(f"    type={tid} ({type_names[tid]}): {n:,}")
+    if flat_is_mmap:
+        flat_mmap._mmap.close()
+
+    # ═══════════════════════════════════════════════════════
     #  spec.json
     # ═══════════════════════════════════════════════════════
     spec = {
         "session_id": session_dir.name,
         "N": N,
         "N_total": total_frames,
-        "version": "v3-phase1",
+        "version": "v3-phase2",
         "screen": {"width": screen_w, "height": screen_h},
         "frame_interval_ns": FRAME_INTERVAL_NS,
         "visual_siglip": {
@@ -781,6 +1204,26 @@ def preprocess_session(
             "dtype": "float16",
             "model": "dinov2-base",
             "notes": "last_hidden_state, includes CLS + all patch tokens",
+        },
+        "visual_siglip_fovea": {
+            "file": "visual_siglip_fovea.npy",
+            "shape": [N, P_sf, D_sf],
+            "dtype": "float16",
+            "model": "siglip-base-patch16-224",
+            "source": "gaze-centered crop",
+            "crop_size": 448,
+            "gaze_source": "motion_saliency_pseudo",
+            "note": "no frame_target; foveated view around predicted gaze point",
+        },
+        "visual_dinov2_fovea": {
+            "file": "visual_dinov2_fovea.npy",
+            "shape": [N, P_df, D_df],
+            "dtype": "float16",
+            "model": "dinov2-base",
+            "source": "gaze-centered crop",
+            "crop_size": 448,
+            "gaze_source": "motion_saliency_pseudo",
+            "note": "no frame_target; foveated view around predicted gaze point",
         },
         "frame_targets_siglip": {
             "file": "frame_targets_siglip.npy",
@@ -823,6 +1266,37 @@ def preprocess_session(
                 "mouse_path_len", "scroll_dy",
                 "left_held", "right_held", "left_click", "right_click",
             ] + [f"{k}_{suffix}" for k in KEY_ORDER for suffix in ["down", "held"]],
+        },
+        "events": {
+            "flat": "events_flat.npy",
+            "offsets": "events_offsets.npy",
+            "shape_flat": [M, E_DIM],
+            "shape_offsets": [N + 1],
+            "event_dim": E_DIM,
+            "format": "CSR (Compressed Sparse Row)",
+            "dtype_flat": "float32",
+            "dtype_offsets": "int64",
+            "dim_spec": [
+                "type_id", "key_id", "button_id",
+                "x_norm", "y_norm", "dx_norm", "dy_norm",
+                "path_len_norm", "scroll_dy", "dt_ms",
+            ],
+            "type_map": {
+                "0": "key_down", "1": "key_up",
+                "2": "mouse_down", "3": "mouse_up",
+                "4": "move", "5": "scroll",
+            },
+            "button_map": {"0": "left", "1": "right", "2": "middle"},
+            "key_count": K,
+            "move_merge": "segments flushed on non-move events; cursor persists across frames",
+            "down_up_rule": "down and up events each fall into their own frame by ts_ns, never paired",
+            "stats": {
+                "M_total": M,
+                "per_frame_mean": float(counts.mean()),
+                "per_frame_max": int(counts.max()),
+                "per_frame_p50": float(np.median(counts)),
+                "per_frame_p99": float(np.percentile(counts, 99)),
+            },
         },
         "timestamps": {
             "file": "timestamps.npy",

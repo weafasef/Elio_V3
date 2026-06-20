@@ -93,7 +93,7 @@ clap_processor = None
 def _load_clap():
     global clap_model, clap_processor
     from transformers import ClapModel, ClapProcessor
-    from preprocess import CLAP_SNAPSHOT
+    from elio.preprocess import CLAP_SNAPSHOT
     snap = str(CLAP_SNAPSHOT)
     clap_model = ClapModel.from_pretrained(snap).to(device).eval()
     clap_processor = ClapProcessor.from_pretrained(snap)
@@ -113,7 +113,7 @@ siglip = dinov2 = siglip_proc = dinov2_proc = None
 def _load_vision():
     global siglip, dinov2, siglip_proc, dinov2_proc
     from transformers import SiglipVisionModel, Dinov2Model, AutoImageProcessor
-    from preprocess import SIGLIP_PATH, DINOV2_PATH
+    from elio.preprocess import SIGLIP_PATH, DINOV2_PATH
     siglip = SiglipVisionModel.from_pretrained(str(SIGLIP_PATH)).to(device).eval()
     siglip_proc = AutoImageProcessor.from_pretrained(str(SIGLIP_PATH))
     print(f"      SigLIP hidden={siglip.config.hidden_size}")
@@ -131,10 +131,10 @@ print("\n" + "=" * 60)
 print(f"Step 6: 合成数据跑完整管线 (device={device})")
 print("=" * 60)
 
-from preprocess import (
+from elio.preprocess import (
     encode_audio_clap, encode_visual, compute_actions,
     compute_gaze_pseudo_labels, compute_residual_targets,
-    AUDIO_SR, CLAP_SR,
+    AUDIO_SR, CLAP_SR, KEY_TO_IDX,
 )
 import torchaudio.transforms as T
 
@@ -157,7 +157,7 @@ def _make_fake_video(tmp):
 
 def _enc_siglip(tmp):
     from transformers import SiglipVisionModel, AutoImageProcessor
-    from preprocess import SIGLIP_PATH
+    from elio.preprocess import SIGLIP_PATH
     s = SiglipVisionModel.from_pretrained(str(SIGLIP_PATH)).to(device).eval()
     sp = AutoImageProcessor.from_pretrained(str(SIGLIP_PATH))
     cap = cv2.VideoCapture(str(_fake_video))
@@ -181,7 +181,7 @@ def _enc_siglip(tmp):
 
 def _enc_dinov2(tmp):
     from transformers import Dinov2Model, AutoImageProcessor
-    from preprocess import DINOV2_PATH
+    from elio.preprocess import DINOV2_PATH
     d = Dinov2Model.from_pretrained(str(DINOV2_PATH)).to(device).eval()
     dp = AutoImageProcessor.from_pretrained(str(DINOV2_PATH))
     cap = cv2.VideoCapture(str(_fake_video))
@@ -279,7 +279,7 @@ print("\n" + "=" * 60)
 print(f"Step 7: End-to-end synthetic pipeline (device={device})")
 print("=" * 60)
 
-from preprocess import preprocess_session
+from elio.preprocess import preprocess_session
 
 
 def _run_e2e():
@@ -289,7 +289,7 @@ def _run_e2e():
     session.mkdir()
     out_dir = tmp / "processed"
 
-    # 合成 20 帧视频
+    # 合成 20 帧视频 (640x480)
     video_path = session / "video.mp4"
     out = cv2.VideoWriter(str(video_path), cv2.VideoWriter_fourcc(*"mp4v"), 10.0, (640, 480))
     for _ in range(20):
@@ -300,17 +300,44 @@ def _run_e2e():
     np.save(str(session / "audio_raw.npy"),
             np.random.randint(-1000, 1000, (20, 1600), dtype=np.int16))
 
-    # 合成 events
-    (session / "events.jsonl").write_text("\n".join([
-        json.dumps({"type": "mouse_move", "x": 320, "y": 240, "ts_ns": 0}),
-        json.dumps({"type": "mouse_move", "x": 330, "y": 250, "ts_ns": 500_000_000}),
-    ]), encoding="utf-8")
+    # 合成多样事件 (覆盖所有 6 种 type: 0=key_down 1=key_up 2=mouse_down 3=mouse_up 4=move 5=scroll)
+    t0 = 0
+    ev = [
+        # 帧 0: move + key_down
+        {"type": "mouse_move", "x": 320, "y": 240, "ts_ns": t0 + 10_000_000},
+        {"type": "key_press",  "key": "a",    "ts_ns": t0 + 20_000_000},
+        # 帧 1: key_release + mouse_down
+        {"type": "key_release", "key": "a",    "ts_ns": t0 + 100_000_000 + 10_000_000},
+        {"type": "mouse_click", "button": "left", "pressed": True,
+         "ts_ns": t0 + 100_000_000 + 20_000_000},
+        # 帧 2: 快速单击 (down+up 同帧)
+        {"type": "mouse_click", "button": "left", "pressed": False,
+         "ts_ns": t0 + 200_000_000 + 5_000_000},
+        {"type": "mouse_click", "button": "left", "pressed": True,
+         "ts_ns": t0 + 200_000_000 + 10_000_000},
+        {"type": "mouse_click", "button": "left", "pressed": False,
+         "ts_ns": t0 + 200_000_000 + 50_000_000},
+        # 帧 3: move + scroll
+        {"type": "mouse_move", "x": 350, "y": 260, "ts_ns": t0 + 300_000_000 + 10_000_000},
+        {"type": "mouse_scroll", "dy": 3,
+         "ts_ns": t0 + 300_000_000 + 30_000_000},
+        # 帧 4: key_down (长按开始 — down 在帧4)
+        {"type": "key_press",  "key": "ctrl_l", "ts_ns": t0 + 400_000_000 + 10_000_000},
+        # 帧 5-8: 只有 move (长按中，无 key 事件)
+        {"type": "mouse_move", "x": 400, "y": 300, "ts_ns": t0 + 500_000_000 + 10_000_000},
+        {"type": "mouse_move", "x": 420, "y": 310, "ts_ns": t0 + 800_000_000 + 10_000_000},
+        # 帧 9: key_up (长按结束 — up 在帧9，距 down 5 帧)
+        {"type": "key_release", "key": "ctrl_l", "ts_ns": t0 + 900_000_000 + 10_000_000},
+    ]
+    (session / "events.jsonl").write_text(
+        "\n".join(json.dumps(e) for e in ev), encoding="utf-8")
 
+    # ── 单次调用产出全部 12 文件 ──
     preprocess_session(session, out_dir, device=device, batch_size=2,
                        max_frames=20, legacy_audio=False)
 
-    # 验证输出
-    from preprocess import SIGLIP_PATH, DINOV2_PATH
+    # 验证全部 12 文件
+    from elio.preprocess import SIGLIP_PATH, DINOV2_PATH
     from transformers import SiglipVisionModel, Dinov2Model
     siglip_cfg = SiglipVisionModel.from_pretrained(str(SIGLIP_PATH)).config
     dinov2_cfg = Dinov2Model.from_pretrained(str(DINOV2_PATH)).config
@@ -318,24 +345,68 @@ def _run_e2e():
     checks = {
         "visual_siglip.npy": (20, 196, 768),
         "visual_dinov2.npy": (20, 257, 768),
+        "visual_siglip_fovea.npy": None,   # 形状取决于 crop_size，只检查存在+维度
+        "visual_dinov2_fovea.npy": None,
         "frame_targets_siglip.npy": (20, 196, 768),
         "frame_targets_dinov2.npy": (20, 257, 768),
         "audio_clap.npy": (20, 512),
         "gaze_pseudo.npy": (20, 2),
         "actions.npy": (20, 178),
         "timestamps.npy": (20,),
+        "events_flat.npy": None,           # [M, 10]，M 可变
+        "events_offsets.npy": (21,),       # N+1
     }
     for fname, exp in checks.items():
-        arr = np.load(str(out_dir / fname), mmap_mode="r")
-        assert arr.shape == exp, f"{fname}: {arr.shape} != {exp}"
+        fpath = out_dir / fname
+        assert fpath.exists(), f"{fname} not found"
+        arr = np.load(str(fpath), mmap_mode="r")
+        if exp is not None:
+            assert arr.shape == exp, f"{fname}: {arr.shape} != {exp}"
+        if fname == "events_flat.npy":
+            assert arr.ndim == 2 and arr.shape[1] == 10, \
+                f"events_flat shape: {arr.shape}"
+        if fname.endswith("fovea.npy"):
+            assert arr.shape[2] == 768, f"{fname} dim: {arr.shape}"
+            assert not np.any(np.isnan(arr[:3].astype(np.float64))), \
+                f"{fname} NaN"
+        arr._mmap.close()
 
     gaze = np.load(str(out_dir / "gaze_pseudo.npy"))
     assert gaze[0, 0] == 0.5 and gaze[0, 1] == 0.5, "frame0 not center"
 
     tgt = np.load(str(out_dir / "frame_targets_siglip.npy"), mmap_mode="r")
     assert np.all(tgt[-1] == 0), "last frame not zero"
+    tgt._mmap.close()
 
-    # cleanup
+    # 验证事件类型全覆盖
+    flat = np.load(str(out_dir / "events_flat.npy"), mmap_mode="r")
+    offsets = np.load(str(out_dir / "events_offsets.npy"))
+    assert offsets[-1] == flat.shape[0], \
+        f"CSR: offsets[-1]={offsets[-1]} != M={flat.shape[0]}"
+    assert np.all(np.diff(offsets) >= 0), "CSR offsets not monotonic"
+
+    type_ids = flat[:, 0].astype(np.int32)
+    for tid, name in {0: "key_down", 1: "key_up", 2: "mouse_down",
+                       3: "mouse_up", 4: "move", 5: "scroll"}.items():
+        count = int((type_ids == tid).sum())
+        assert count > 0, f"Missing event type {tid} ({name})"
+
+    # 验证长按: key_down 在帧4, key_up 在帧9 (各自独立落桶)
+    frame4_events = flat[offsets[4]:offsets[5]]
+    frame9_events = flat[offsets[9]:offsets[10]]
+    ctrl_id = KEY_TO_IDX.get("ctrl_l", -1)
+    assert any((frame4_events[:, 0] == 0) & (frame4_events[:, 1] == ctrl_id)), \
+        "frame 4 should have ctrl_l key_down"
+    assert any((frame9_events[:, 0] == 1) & (frame9_events[:, 1] == ctrl_id)), \
+        "frame 9 should have ctrl_l key_up"
+
+    flat._mmap.close()
+
+    # spec 包含全部字段
+    spec = json.loads((out_dir / "spec.json").read_text())
+    assert "visual_siglip_fovea" in spec, "spec missing fovea"
+    assert "events" in spec, "spec missing events"
+
     del siglip_cfg, dinov2_cfg
     import gc; gc.collect()
     for f in tmp.rglob("*"):
@@ -348,7 +419,7 @@ def _run_e2e():
             d.rmdir()
         except Exception:
             pass
-    print("      E2E pipeline: 20 synthetic frames → all 8 files validated")
+    print("      E2E pipeline: 20 frames → 12 files all validated")
 
 
 check("7  e2e synthetic", _run_e2e)
