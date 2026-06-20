@@ -1,0 +1,35 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Data directories (large binary files, not source code)
+data/raw/
+data/processed/
+
+# Model weights (downloaded from HuggingFace)
+models/
+
+# External tools / binaries
+tools/
+
+# Virtual environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Checkpoints (produced by trainer)
+trainer/checkpoints/
