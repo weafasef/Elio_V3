@@ -249,6 +249,28 @@ class ElioModel(nn.Module):
             "intent_m": intents[:, :, 4],   # mouse
         }
 
+    def encode_frame_tokens(self, batch: dict) -> torch.Tensor:
+        """只做投影不进 Llama。返回每帧 34 个 token: [B, K, 34, 2048]。
+
+        供 TTT 循环使用 —— 循环内逐帧取 ft = frame_tokens[:, t]。
+        保留 forward() 不动 (Step 4 批处理回归测试用)。
+        """
+        # ── 视觉编码 ──
+        full_vis = self.visual_full(batch["siglip"], batch["dinov2"])           # [B, K, Q, D]
+        fovea_vis = self.visual_fovea(batch["siglip_fov"], batch["dinov2_fov"]) # [B, K, Q, D]
+
+        # ── 音频投影 ──
+        audio = self.proj_audio(batch["audio"])                                  # [B, K, D]
+        audio = audio.unsqueeze(2)                                               # [B, K, 1, D]
+
+        # ── 动作投影 ──
+        action = self.proj_action(batch["actions"])                              # [B, K, D]
+        action = action.unsqueeze(2)                                             # [B, K, 1, D]
+
+        # ── 每帧拼接: [audio 1][full Q][fovea Q][action 1] ──
+        frame_tokens = torch.cat([audio, full_vis, fovea_vis, action], dim=2)   # [B, K, 34, D]
+        return frame_tokens
+
     @property
     def tokens_per_frame(self) -> int:
         return 1 + self.visual_queries + self.visual_queries + 1
