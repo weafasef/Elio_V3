@@ -33,3 +33,6 @@ desktop.ini
 
 # Checkpoints (produced by trainer)
 trainer/checkpoints/
+
+# Recording sessions
+elio/session_*/
